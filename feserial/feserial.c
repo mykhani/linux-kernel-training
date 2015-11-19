@@ -5,9 +5,16 @@
 #include <linux/pm_runtime.h>
 #include <asm/io.h>
 #include <uapi/linux/serial_reg.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 
 /* Add your code here */
+
 struct feserial_dev {
+	struct miscdevice miscdev;
+	struct device *dev;
 	void __iomem *regs;
 };
 
@@ -49,12 +56,57 @@ static void printString(struct feserial_dev *dev, char *string)
 	}
 }
 
+static ssize_t feserial_write(struct file *filp, const char __user *buf,
+                          size_t count, loff_t *f_pos)
+{
+        struct feserial_dev *priv;
+	char *data;
+	
+	priv = container_of(filp->private_data, struct feserial_dev, miscdev);
+
+	dev_info(priv->dev, "Writing to UART address %p \n", priv->regs);
+	
+	/* allocate memory for data to be written */
+	data = kmalloc(sizeof(char) * count, GFP_KERNEL);
+
+	if (!data) {
+		dev_err(priv->dev, "Unable to allocate kernel buffer for data \n");
+		return -ENOMEM;
+	}
+
+        if (copy_from_user(data, buf, count))
+                return -EFAULT;
+	
+	printString(priv, data);
+
+	kfree(data);
+	return count;
+	
+}
+/* patch the kernel to get private data from file pointer */
+static ssize_t feserial_read(struct file *filp, char __user *buf, size_t count,
+                         loff_t *f_pos)
+{
+#if 0
+        struct fpga_dev *priv = filp->private_data;
+        return simple_read_from_buffer(buf, count, f_pos,
+                                       priv->vaddr, priv->bytes);
+#endif
+	return -EINVAL;
+}
+
+
+static const struct file_operations feserial_fops = {
+        .write          = feserial_write,
+        .read           = feserial_read,
+};
+
 static int feserial_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	struct feserial_dev  *dev;
 	unsigned int uartclk, baud_divisor;
-
+	int ret;
 	
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	
@@ -108,15 +160,46 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
-	printString(dev, "Writing this on UART \r\n");
+	/* Initialize misc device */
+	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+	dev->miscdev.name = kasprintf(GFP_KERNEL, "feserial-%x", res->start);
+
+        dev->miscdev.fops = &feserial_fops;
+
+	/* store device structure to use dev_err calls */
+	dev->dev = &pdev->dev; 
+
+	/* store driver private data */
+	platform_set_drvdata(pdev, dev);
+
+	/* register mis device */
+	ret = misc_register(&dev->miscdev);
+	if (ret) {
+		dev_err(&pdev->dev, "Unable to register misc device \n");
+		goto fail;
+	}
+
+	//printString(dev, "Writing this on UART \r\n");
 	
 	return 0;
+
+fail:
+	kfree(dev->miscdev.name);
+	return ret; 
 }
 
 static int feserial_remove(struct platform_device *pdev)
 {
+	struct feserial_dev *dev = platform_get_drvdata(pdev);
+	
+	if (dev->miscdev.name)
+		kfree(dev->miscdev.name);
+	
+	misc_deregister(&dev->miscdev);
+ 
 	pr_info("Called feserial_remove\n");
 	pm_runtime_disable(&pdev->dev);
+	
 
         return 0;
 }
