@@ -9,13 +9,19 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <asm/ioctl.h>
 
 /* Add your code here */
+
+/* define ioctl numbers */
+#define IOCTL_SERIAL_RESET_COUNTER 0
+#define IOCTL_SERIAL_GET_COUNTER 1
 
 struct feserial_dev {
 	struct miscdevice miscdev;
 	struct device *dev;
 	void __iomem *regs;
+	int characters;
 };
 
 static unsigned int reg_read(struct feserial_dev *dev, int offset)
@@ -80,6 +86,9 @@ static ssize_t feserial_write(struct file *filp, const char __user *buf,
 	printString(priv, data);
 
 	kfree(data);
+	/* Increment the characters count */
+	priv->characters += count;
+
 	return count;
 	
 }
@@ -95,10 +104,41 @@ static ssize_t feserial_read(struct file *filp, char __user *buf, size_t count,
 	return -EINVAL;
 }
 
+static long feserial_ioctl(struct file *filp, unsigned int cmd, unsigned long data)
+{
+        struct feserial_dev *priv;
+	int ret = 0;
+
+        priv = container_of(filp->private_data, struct feserial_dev, miscdev);
+
+        dev_dbg(priv->dev, "IOCTL cmd = 0x%x", cmd);
+
+        switch (cmd) {
+        case IOCTL_SERIAL_RESET_COUNTER:
+                dev_dbg(priv->dev, ": IOCTL_SERIAL_RESET_COUNTER.\n");
+		/* reset character count here */
+		priv->characters = 0;
+		break;
+	case IOCTL_SERIAL_GET_COUNTER:
+        	dev_dbg(priv->dev, ": IOCTL_SERIAL_GET_COUNTER.\n");
+		if (copy_to_user((int __user *)data, &priv->characters, sizeof(int))) {
+			dev_err(priv->dev, "failed to copy data to userlan\n");
+			ret = -EFAULT;
+		}
+		break;
+        default:
+                dev_err(priv->dev, ": unsupported ioctl %d.\n", cmd);
+                ret = -ENOIOCTLCMD;
+        }
+
+        return ret;
+}
+
 
 static const struct file_operations feserial_fops = {
         .write          = feserial_write,
         .read           = feserial_read,
+	.unlocked_ioctl = feserial_ioctl,
 };
 
 static int feserial_probe(struct platform_device *pdev)
