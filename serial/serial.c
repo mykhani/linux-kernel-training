@@ -1,3 +1,4 @@
+#define DEBUG
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -10,6 +11,10 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <asm/ioctl.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
 
 /* Add your code here */
 
@@ -17,14 +22,22 @@
 #define IOCTL_SERIAL_RESET_COUNTER 0
 #define IOCTL_SERIAL_GET_COUNTER 1
 
-struct feserial_dev {
+/* define size for cicular buffer for serial */
+#define SERIAL_BUFSIZE 16
+
+struct serial_dev {
 	struct miscdevice miscdev;
 	struct device *dev;
 	void __iomem *regs;
+	int irq;
 	int characters;
+	char serial_buf[SERIAL_BUFSIZE];
+	int serial_buf_rd;
+	int serial_buf_wr;
+	wait_queue_head_t wait; /* workqueue for waiting on serial data */
 };
 
-static unsigned int reg_read(struct feserial_dev *dev, int offset)
+static unsigned int reg_read(struct serial_dev *dev, int offset)
 {
 	unsigned int val;
 	void *addr;
@@ -36,7 +49,7 @@ static unsigned int reg_read(struct feserial_dev *dev, int offset)
 	return val;	
 } 
 
-static void reg_write(struct feserial_dev *dev, unsigned int val, int offset)
+static void reg_write(struct serial_dev *dev, unsigned int val, int offset)
 {
 	void *addr;
 
@@ -44,7 +57,7 @@ static void reg_write(struct feserial_dev *dev, unsigned int val, int offset)
 	writel(val, addr);
 }
 
-static void write_char(struct feserial_dev *dev, char c)
+static void write_char(struct serial_dev *dev, char c)
 {
 	/* wait for trasmit buffer to become empty */
 	while(!(reg_read(dev, UART_LSR) & UART_LSR_THRE))
@@ -53,22 +66,22 @@ static void write_char(struct feserial_dev *dev, char c)
 	reg_write(dev, c, UART_TX); 
 }
 
-static void printString(struct feserial_dev *dev, char *string) 
+static void printString(struct serial_dev *dev, char *string) 
 {
 	while(*string != '\0') {
-	
+		pr_debug("Writing character %c to UART %x \n", *string, dev->regs);
 		write_char(dev, *string);
 		string++;
 	}
 }
 
-static ssize_t feserial_write(struct file *filp, const char __user *buf,
+static ssize_t serial_write(struct file *filp, const char __user *buf,
                           size_t count, loff_t *f_pos)
 {
-        struct feserial_dev *priv;
+        struct serial_dev *priv;
 	char *data;
 	
-	priv = container_of(filp->private_data, struct feserial_dev, miscdev);
+	priv = container_of(filp->private_data, struct serial_dev, miscdev);
 
 	dev_info(priv->dev, "Writing to UART address %p \n", priv->regs);
 	
@@ -93,23 +106,40 @@ static ssize_t feserial_write(struct file *filp, const char __user *buf,
 	
 }
 /* patch the kernel to get private data from file pointer */
-static ssize_t feserial_read(struct file *filp, char __user *buf, size_t count,
+static ssize_t serial_read(struct file *filp, char __user *buf, size_t count,
                          loff_t *f_pos)
 {
-#if 0
-        struct fpga_dev *priv = filp->private_data;
-        return simple_read_from_buffer(buf, count, f_pos,
-                                       priv->vaddr, priv->bytes);
-#endif
-	return -EINVAL;
+	char *buffer;
+	char byte;
+	int ret;
+	struct serial_dev *priv = container_of(filp->private_data,
+						 struct serial_dev, miscdev);
+
+	/* if data is not yet available, wait */
+	if (priv->serial_buf_rd == priv->serial_buf_wr) {
+		wait_event_interruptible(priv->wait, priv->serial_buf_rd != priv->serial_buf_wr);
+	}
+	
+	buffer = priv->serial_buf;
+	
+	byte = buffer[priv->serial_buf_rd++];
+	/* wrap-around the read position */
+	priv->serial_buf_rd %= SERIAL_BUFSIZE;
+	/* pass the read byte to userspace */
+	if (copy_to_user(buf, &byte, sizeof(char))) {
+        	dev_err(priv->dev, "failed to copy data to userland\n");
+                ret = -EFAULT;
+        }
+	
+	return (sizeof(char));
 }
 
-static long feserial_ioctl(struct file *filp, unsigned int cmd, unsigned long data)
+static long serial_ioctl(struct file *filp, unsigned int cmd, unsigned long data)
 {
-        struct feserial_dev *priv;
+        struct serial_dev *priv;
 	int ret = 0;
 
-        priv = container_of(filp->private_data, struct feserial_dev, miscdev);
+        priv = container_of(filp->private_data, struct serial_dev, miscdev);
 
         dev_dbg(priv->dev, "IOCTL cmd = 0x%x", cmd);
 
@@ -134,28 +164,48 @@ static long feserial_ioctl(struct file *filp, unsigned int cmd, unsigned long da
         return ret;
 }
 
-
-static const struct file_operations feserial_fops = {
-        .write          = feserial_write,
-        .read           = feserial_read,
-	.unlocked_ioctl = feserial_ioctl,
+static const struct file_operations serial_fops = {
+        .write          = serial_write,
+        .read           = serial_read,
+	.unlocked_ioctl = serial_ioctl,
 };
 
-static int feserial_probe(struct platform_device *pdev)
+/* Interrupt handler */
+irqreturn_t serial_interrupt(int irq, void *device)
+{
+	struct serial_dev *dev = device;
+	char *buffer = dev->serial_buf;
+	char byte;
+	
+	byte = reg_read(dev,UART_RX);
+	
+	pr_debug("Received a character %c \n", byte);
+	
+	/* write the byte to circular buffer and increment write position */
+	buffer[dev->serial_buf_wr++] = byte;
+	/* Check for size and roll back */
+	dev->serial_buf_wr %= SERIAL_BUFSIZE;
+
+	wake_up(&dev->wait); /* wake up the read thread waiting */
+	
+	return IRQ_HANDLED;
+}
+static int serial_probe(struct platform_device *pdev)
 {
 	struct resource *res;
-	struct feserial_dev  *dev;
+	struct serial_dev  *dev;
 	unsigned int uartclk, baud_divisor;
+	unsigned int reg; /* to store the register value */
 	int ret;
 	
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	
 	if (!dev) {
-		dev_err(&pdev->dev, "Unable to allocate memory for feserial device \r\n");
+		dev_err(&pdev->dev, "Unable to allocate memory for serial device \r\n");
 		return -ENOMEM;
 	}	
 
-	pr_info("Called feserial_probe\n");
+	pr_info("Called serial_probe\n");
 
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -173,6 +223,11 @@ static int feserial_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Cannot remap registers \n");
 		return -ENOMEM;
 	}
+	
+	dev->irq = platform_get_irq(pdev, 0);
+	
+	/* initialize waitqueue */
+	init_waitqueue_head(&dev->wait);
 
 	pm_runtime_enable(&pdev->dev);
 	pm_runtime_get_sync(&pdev->dev);
@@ -196,16 +251,31 @@ static int feserial_probe(struct platform_device *pdev)
 
 	reg_write(dev, UART_LCR_WLEN8, UART_LCR);
 
+	/* Enable interrupt handler */
+	/* Read the contents of UART_IER register */
+	reg = reg_read(dev, UART_IER);
+	/* Set the bit for enabling receiver interrupt */
+	reg |= UART_IER_RDI;
+	/* Write back the value to IER register */
+	reg_write(dev, reg, UART_IER);
+
 	/* Request SW reset */
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
 	/* Initialize misc device */
 	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
-	dev->miscdev.name = kasprintf(GFP_KERNEL, "feserial-%x", res->start);
+	dev->miscdev.name = kasprintf(GFP_KERNEL, "serial-%x", res->start);
 
-        dev->miscdev.fops = &feserial_fops;
+        dev->miscdev.fops = &serial_fops;
+	/* Register interrupt handler */
+	dev_dbg(&pdev->dev, "Registering interrupt handler for IRQ %d \n", dev->irq);
 
+	ret = devm_request_irq(&pdev->dev, dev->irq, serial_interrupt, 0, dev->miscdev.name, dev);
+	if (ret) {
+		dev_err(&pdev->dev, "Unable to register interrupt handler \n");
+		goto fail;
+	}
 	/* store device structure to use dev_err calls */
 	dev->dev = &pdev->dev; 
 
@@ -216,28 +286,32 @@ static int feserial_probe(struct platform_device *pdev)
 	ret = misc_register(&dev->miscdev);
 	if (ret) {
 		dev_err(&pdev->dev, "Unable to register misc device \n");
-		goto fail;
+		goto unregister_interrupt;
 	}
 
 	//printString(dev, "Writing this on UART \r\n");
 	
 	return 0;
 
+unregister_interrupt:
+	devm_free_irq(dev->dev, dev->irq, dev);
+	
 fail:
 	kfree(dev->miscdev.name);
 	return ret; 
 }
 
-static int feserial_remove(struct platform_device *pdev)
+static int serial_remove(struct platform_device *pdev)
 {
-	struct feserial_dev *dev = platform_get_drvdata(pdev);
+	struct serial_dev *dev = platform_get_drvdata(pdev);
 	
 	if (dev->miscdev.name)
 		kfree(dev->miscdev.name);
 	
+	devm_free_irq(dev->dev, dev->irq, dev);
 	misc_deregister(&dev->miscdev);
  
-	pr_info("Called feserial_remove\n");
+	pr_info("Called serial_remove\n");
 	pm_runtime_disable(&pdev->dev);
 	
 
@@ -245,22 +319,22 @@ static int feserial_remove(struct platform_device *pdev)
 }
 #if defined(CONFIG_OF)
 static const struct of_device_id my_serial_of_match[] = {
-	{ .compatible = "free-electrons,serial" },
+	{ .compatible = "mgc,linux-lab" },
 	{},
 };
 
 MODULE_DEVICE_TABLE(of, my_serial_of_match);
 #endif
 
-static struct platform_driver feserial_driver = {
+static struct platform_driver serial_driver = {
         .driver = {
-                .name = "feserial",
+                .name = "serial",
                 .owner = THIS_MODULE,
 		.of_match_table = of_match_ptr(my_serial_of_match),
         },
-        .probe = feserial_probe,
-        .remove = feserial_remove,
+        .probe = serial_probe,
+        .remove = serial_remove,
 };
 
-module_platform_driver(feserial_driver);
+module_platform_driver(serial_driver);
 MODULE_LICENSE("GPL");

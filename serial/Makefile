@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-obj-m := feserial.o
+obj-m := serial.o
 else
 KDIR := $(HOME)/ykhan/linux-3.19.8
 all:
