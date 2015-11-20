@@ -1,0 +1,59 @@
+
+micro cs2 -> RTOS
+
+devm_* stands for device model (recommended for use in newer drivers)
+
+
+Process contex = CPU regs + stack + tcb + MMU tables
+Thread context = above - MMU tables
+
+
+In Linux, each userspace thread is mapped to a kernel thread represented by struct task.
+Struct task includes all the required context.
+
+Task stats:
+Ready: waiting for priority to be highest and scheduling point to execute
+
+A task in wait state:
+TASK_UNINTERRUPTIBLE: The application waits, won't respond to signals
+TASK_KILLABLE: will responsd to kill or termination signals
+
+
+Blocking call: synchronous
+Non-blocking call: asynchronous
+
+safe tty
+
+non-exclusive waiting -> all waiting tasks are waked
+exclusive waiting
+
+The linux disables all other ISRs while executing one ISR. (No ISR nesting)
+
+Top half : ISR (running first)
+Bottom half: complete the process
+-> workqeue
+-> takslets
+-> threaded interrupts (a single kernel thread is created, not a thread for each isr)
+
+
+atomic = the operation is not interruptible
+
+locking -> access synchronization
+->avoiding race conditions
+
+problem occurs if:
+a) a shared resource is being used by multiple contexts
+b) access is not atomic
+
+Solution -> locking
+
+a) acquire the lock before using
+b) release the lock after use
+
+
+Resource analysis
+
+	read write 	ISR
+read	X	X	X
+write	X	X	X
+ISR
