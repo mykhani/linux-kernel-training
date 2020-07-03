@@ -59,13 +59,14 @@ write	X	X	X
 ISR
 
 ```
+Spin lock API usage matrix
                                                                    Attempt to acquire the resource by
-               +-------------------------------+------------------+-----------------+----------------+--------------------+
-               |                               | softirq/tasklet  | process context | kernel thread  |  interrupt context |
-               +-------------------------------+------------------+-----------------+----------------+--------------------+
-Resource       |softirq/tasklet                | spin_lock_bh()   | spin_lock_bh()  | spin_lock_bh() |  spin_lock_irq*    |
-acquired by    |process context                | spin_lock_bh()   | spin_lock()     | spin_lock()    |  spin_lock_irq*    |
-               |kernel thread(workqueue etc)   | spin_lock_bh()   | spin_lock()     | spin_lock()    |  spin_lock_irq*    |
-               |interrupt context              | spin_lock_irq*   | spin_lock_irq*  | spin_lock_irq* |  spin_lock_irq*    |
-               +-------------------------------+------------------+-----------------+----------------+--------------------+
+               +-------------------------------+------------------+-----------------+-----------------+--------------------+
+               |                               | softirq/tasklet  | process context | kernel thread   |  interrupt context |
+               +-------------------------------+------------------+-----------------+-----------------+--------------------+
+Resource       |softirq/tasklet                | spin_lock_bh()   | spin_lock_bh()  | spin_lock_bh()  |  spin_lock_irq*()  |
+acquired by    |process context                | spin_lock_bh()   | spin_lock()     | spin_lock()     |  spin_lock_irq*()  |
+               |kernel thread(workqueue etc)   | spin_lock_bh()   | spin_lock()     | spin_lock()     |  spin_lock_irq*()  |
+               |interrupt context              | spin_lock_irq*() | spin_lock_irq*()| spin_lock_irq*()|  spin_lock_irq*()  |
+               +-------------------------------+------------------+-----------------+-----------------+---------------------+
 ```
